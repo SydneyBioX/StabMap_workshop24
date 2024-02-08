@@ -1,0 +1,294 @@
+---
+title: "Workshop Part III - Mosaic single cell data integration"
+author: "Shila Ghazanfar"
+date: "2024-02-08"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+You will need to install:
+
+- Latest development version of StabMap package (github)
+
+- If using anndata object from Parts I-II, zellkonverter package from Bioconductor
+
+- If using reducedDimGirafe function, then the ggiraph package from CRAN
+
+```{r}
+library(StabMap)
+
+library(SingleCellExperiment)
+library(BiocNeighbors)
+library(scran)
+library(scuttle)
+library(batchelor)
+library(bluster)
+
+library(zellkonverter)
+library(S4Vectors)
+
+library(plotly)
+library(ggplot2)
+library(patchwork)
+library(ggiraph)
+library(RColorBrewer)
+library(grDevices)
+```
+
+Read in the helpful functions. Note the function `plotReducedDimGirafe` requires
+the package `ggiraph`
+
+```{r}
+source("workshop_functions.R")
+```
+
+# Read in the data
+
+```{r}
+sce = readH5AD("data/scFFPE_raw.h5ad")
+spe = readH5AD("data/xenium_rep1.h5ad")
+spe <- spe[,!spe$Cluster %in% c("Unlabeled")]
+```
+
+# Randomly select cells from the spe and sce data objects
+
+```{r}
+set.seed(2024)
+spe <- spe[,sample(colnames(spe), 10000)]
+sce <- sce[,sample(colnames(sce), 5000)]
+```
+
+Normalise and transform
+
+```{r}
+spe <- logNormCounts(spe, assay.type = "X")
+sce <- logNormCounts(sce, assay.type = "X")
+```
+
+Perform highly variable gene selection for the sce data. Select the 3000 most
+highly variable genes.
+
+```{r}
+stats <- modelGeneVar(sce, assay.type = "logcounts")
+hvgs = getTopHVGs(stats, n = 1000)
+sce <- sce[hvgs,]
+```
+
+Calculate the mean expression of spatial neighbours of Xenium data
+
+```{r}
+logcounts_neighbours = getNeighbourMean(spe, assayName = "logcounts",
+                                        spatialReducedDim = "spatial", kval = 5,
+                                        includeSelf = FALSE)
+rownames(logcounts_neighbours) <- paste0(rownames(logcounts_neighbours), "_neighbours")
+
+assay(spe, "logcounts_neighbours", withDimnames = FALSE) <- logcounts_neighbours
+
+concatenated_logcounts = rbind(assay(spe, "logcounts"),
+                               logcounts_neighbours)
+```
+
+Check technical requirements for input data. They should not have the same colnames. 
+
+```{r}
+length(intersect(colnames(sce), colnames(spe)))
+```
+
+Run StabMap. Below are alternative calls to stabMap which affect the mosaic
+data integration. Choose just one to run.
+
+```{r}
+stab = stabMap(assay_list = list(
+  "sce" = assay(sce, "logcounts"),
+  "spe" = assay(spe, "logcounts")),
+  reference_list = c("sce", "spe"),
+  plot = FALSE)
+
+if (FALSE) {
+  stab = stabMap(assay_list = list(
+    "sce" = assay(sce, "logcounts"),
+    "spe" = assay(spe, "logcounts")),
+    reference_list = c("sce"),
+    plot = FALSE)
+  
+  stab = stabMap(assay_list = list(
+    "sce" = assay(sce, "logcounts"),
+    "spe" = assay(spe, "logcounts")),
+    reference_list = c("spe"),
+    plot = FALSE)
+  
+  stab = stabMap(assay_list = list(
+    "sce" = assay(sce, "logcounts"),
+    "spe" = concatenated_logcounts),
+    reference_list = c("spe", "sce"),
+    plot = FALSE)
+}
+```
+
+Reweight the contributions of the two reference datasets by forcing the same
+total L1 norm for both data
+
+```{r}
+plot(colSums(abs(stab)))
+
+stab_reweighted = reWeightEmbedding(stab)
+
+plot(colSums(abs(stab_reweighted)))
+```
+
+Perform batch correction between the two data sources using reducedMNN.
+
+```{r}
+mnn_out = reducedMNN(stab_reweighted[colnames(sce),],
+                     stab_reweighted[colnames(spe),])
+
+stabmap_reweighted_corrected = mnn_out[["corrected"]]
+```
+
+Start to combine these two data into one object. Gather the joint column metadata.
+
+```{r}
+joint_cData = combineRows(colData(sce), colData(spe))
+```
+
+Approach 1: Use the corrected StabMap embedding to impute gene expression of the spatial
+cells. Then, combine the imputed and observed logcounts.
+
+Note that imputation will take a few minutes to run.
+
+```{r}
+imp = imputeEmbedding(assay_list = list(sce = assay(sce, "logcounts"),
+                                        spe = assay(spe, "logcounts")),
+                      embedding = stabmap_reweighted_corrected,
+                      reference = colnames(sce),
+                      query = colnames(spe))
+
+joint_assay = cbind(assay(sce, "logcounts"), imp[["sce"]])
+```
+
+Approach 2 (For neighbourhood features): impute the neighbourhood expression of
+the scRNA-seq cells.
+
+```{r}
+if (FALSE) {
+  imp = imputeEmbedding(assay_list = list(sce = assay(sce, "logcounts"),
+                                          spe = concatenated_logcounts),
+                        embedding = stabmap_reweighted_corrected,
+                        reference = colnames(spe),
+                        query = colnames(sce))
+  
+  joint_assay = cbind(imp[["spe"]], concatenated_logcounts)
+}
+```
+
+Using these joint assay and cell metadata, create a new SingleCellExperiment 
+object. Perform joint clustering of the data using the StabMap low-dimensional 
+space.
+
+```{r}
+joint = SingleCellExperiment(
+  assays = list(logcounts = joint_assay),
+  reducedDims = list(
+    StabMap = stabmap_reweighted_corrected[colnames(joint_assay),]
+  ),
+  colData = joint_cData[colnames(joint_assay),]
+)
+
+joint$dataset <- ifelse(colnames(joint) %in% colnames(sce), "sce", "spe")
+reducedDim(joint, "spatial") <- cbind(joint$x_centroid, joint$y_centroid)
+
+joint <- runUMAP(joint, dimred = "StabMap")
+
+clus = clusterRows(reducedDim(joint, "StabMap"), NNGraphParam())
+joint$joint_cluster = clus
+```
+
+Visualise these, noting we can plot all imputed genes. First set a colour 
+scheme for the clusters.
+
+```{r}
+clusterCount = length(unique(joint$Cluster))
+jointclusterCount = length(unique(joint$joint_cluster))
+clusterPalette = colorRampPalette(brewer.pal(9, "Set1"))(clusterCount)
+jointclusterPalette = colorRampPalette(brewer.pal(9, "Set1"))(jointclusterCount)
+```
+
+Plot the cells by dataset and cell type labels. Note the 'stromal' label
+is transcriptionally diverse.
+
+```{r}
+g1 = plotUMAP(joint[, sample(colnames(joint))], colour_by = "dataset", point_size = 0.5) + 
+  scale_colour_brewer(palette = "Set1") + 
+  theme(legend.position = "bottom") + 
+  guides(colour = guide_legend(title = "", override.aes = list(size = 3)))
+
+g2 = plotUMAP(joint[, sample(colnames(joint))], colour_by = "joint_cluster", point_size = 0.5) + 
+  scale_colour_manual(values = jointclusterPalette) +  
+  theme(legend.position = "bottom") + 
+  guides(colour = guide_legend(title = "", override.aes = list(size = 3)))
+
+g3 = plotUMAP(joint[, sample(colnames(joint))], colour_by = "Cluster", point_size = 0.5) + 
+  scale_colour_manual(values = clusterPalette) + 
+  theme(legend.position = "bottom") + 
+  guides(colour = guide_legend(title = "", override.aes = list(size = 3)))
+
+g4 = plotReducedDim(joint[, sample(colnames(joint))], "spatial", 
+                    colour_by = "Cluster", point_size = 0.5) +
+  scale_colour_manual(values = clusterPalette) + coord_fixed() + 
+  theme(legend.position = "bottom") + 
+  guides(colour = guide_legend(title = "", override.aes = list(size = 3)))
+
+g5 = plotReducedDim(joint[, sample(colnames(joint))], "spatial", 
+                    colour_by = "joint_cluster", point_size = 0.5) +
+  scale_colour_manual(values = jointclusterPalette) + coord_fixed() + 
+  theme(legend.position = "bottom") + 
+  guides(colour = guide_legend(title = "", override.aes = list(size = 3)))
+
+g1 + g2 + g3
+
+g4 + g5
+
+if (FALSE) {
+ggplotly(g2)
+}
+```
+
+Plot the imputed genes, split by dataset and then by spatial coordinates.
+
+```{r}
+gene = "ERBB2"
+gene = "FCGR3A"
+gene_neighbours = paste0(gene, "_neighbours")
+
+plotUMAP(joint[,sample(colnames(joint))], colour_by = gene,
+         other_fields = list("dataset")) + facet_wrap(~dataset)
+
+plotReducedDim(joint, "spatial", colour_by = gene) +
+  theme(axis.line = element_blank()) +
+  theme(axis.text = element_blank()) +
+  theme(axis.ticks = element_blank()) +
+  xlab("") +
+  ylab("") +
+  theme(legend.position = "bottom")
+```
+
+For the Approach 2, we can compare measured expression against imputed 
+neighbourhood expression by looking back at the sce object.
+
+```{r}
+if (FALSE) {
+common_genes = intersect(rownames(spe), rownames(sce))
+cormat = cor(as.matrix(t(assay(sce, "logcounts")[common_genes,])),
+             as.matrix(t(assay(joint[,colnames(sce)], "logcounts")[paste0(common_genes, "_neighbours"),])))
+sort(setNames(diag(cormat), rownames(cormat)))
+}
+```
+
+# Finish
+
+```{r}
+sessionInfo()
+```
