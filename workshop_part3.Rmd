@@ -1,13 +1,26 @@
 ---
 title: "Workshop Part III - Mosaic single cell data integration"
 author: "Shila Ghazanfar"
-date: "2024-02-08"
-output: html_document
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+       html_document:
+                     toc: true
+                     toc_float:
+                           collapsed: false
+                           smooth_scroll: false
+                     code_folding: hide
+                     fig_width: 10 
+                     fig_height: 8
 ---
-
+  
 ```{r setup, include=FALSE}
-knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE,
+                      cache = FALSE, cache.lazy = FALSE)
 ```
+
+While it is possible to fully compile this RMarkdown document, during the 
+workshop it is advisable to run the lines of code individually and make changes
+to the analysis parameters to help in learning and exploring.
 
 You will need to install:
 
