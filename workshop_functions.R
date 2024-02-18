@@ -2,7 +2,8 @@ getNeighbourMean = function(spe,
                             assayName = "counts",
                             spatialReducedDim = "spatial",
                             kval = 5,
-                            includeSelf = FALSE) {
+                            includeSelf = FALSE,
+                            concatenate_rownames = "_neighbours") {
   
   require(BiocNeighbors)
   
@@ -32,6 +33,8 @@ getNeighbourMean = function(spe,
   knn_mean_counts = t(do.call(rbind, knn_exprs))
   rownames(knn_mean_counts) <- rownames(spe)
   colnames(knn_mean_counts) <- colnames(spe)
+  
+  rownames(knn_mean_counts) <- paste0(rownames(knn_mean_counts), concatenate_rownames)
   
   return(knn_mean_counts)
 }
